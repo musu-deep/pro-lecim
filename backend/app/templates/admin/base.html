@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}Administration{% endblock %} — LECIM</title>
+<link rel="icon" type="image/jpeg" href="/static/img/logo.jpg">
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-topbar-mobile">
+  <button type="button" class="admin-nav-toggle" id="admin-nav-toggle" aria-label="Ouvrir le menu" aria-expanded="false"><span></span><span></span><span></span></button>
+  <img src="/static/img/logo.jpg" alt="Logo LECIM">
+  <strong>LECIM</strong>
+</div>
+<div class="sidebar-overlay" id="admin-sidebar-overlay"></div>
+<div class="admin-shell">
+  <aside class="sidebar" id="admin-sidebar">
+    <div class="sidebar-brand">
+      <img src="/static/img/logo.jpg" alt="Logo LECIM">
+      <h2>LECIM</h2>
+    </div>
+    <span class="tag">{{ admin.poste_label }}</span>
+    <div class="admin-search">
+      <input type="text" id="admin-search-input" placeholder="Rechercher (courrier, tâches...)" autocomplete="off">
+      <div class="admin-search-results" id="admin-search-results"></div>
+    </div>
+    {% set pending = admin.pending_action_counts() %}
+    <nav>
+      <a href="/admin" class="{{ 'active' if active == 'dashboard' else '' }}">Tableau de bord</a>
+      <a href="/admin/notifications" class="{{ 'active' if active == 'notifications' else '' }}">Notifications</a>
+      <a href="/admin/cartes/mine" class="{{ 'active' if active == 'carte_mine' else '' }}">Ma carte de membre</a>
+      <a href="/admin/attestation/pdf" target="_blank">Mon attestation d'appartenance</a>
+      <a href="/admin/mon-compte/mot-de-passe" class="{{ 'active' if active == 'mon_compte' else '' }}">Changer mon mot de passe</a>
+      <a href="/admin/calendrier" class="{{ 'active' if active == 'calendrier' else '' }}">Calendrier</a>
+      <a href="/admin/sondages" class="{{ 'active' if active == 'sondages' else '' }}">Sondages</a>
+      <a href="/admin/idees" class="{{ 'active' if active == 'idees' else '' }}">Boîte à idées</a>
+      <a href="/admin/taches" class="{{ 'active' if active == 'taches' else '' }}">Mes tâches</a>
+      <a href="/admin/changelog" class="{{ 'active' if active == 'changelog' else '' }}">Nouveautés de la plateforme</a>
+
+      {% if admin.can_manage_reunions or admin.can_manage_membres or admin.can_manage_cartes or admin.can_manage_sondages or admin.can_manage_executif or admin.can_manage_delegations or admin.can_manage_historique or admin.can_manage_fondateurs or admin.can_manage_gouvernance or admin.can_examine_adhesions %}
+      <div class="nav-section">
+        <span class="nav-section-title">Vie associative</span>
+        {% if admin.can_manage_reunions %}<a href="/admin/reunions" class="{{ 'active' if active == 'reunions' else '' }}">Réunions</a>{% endif %}
+        {% if admin.can_manage_membres %}<a href="/admin/membres" class="{{ 'active' if active == 'membres' else '' }}">Répertoire des membres</a>{% endif %}
+        {% if admin.can_examine_adhesions %}<a href="/admin/adhesion-requests" class="{{ 'active' if active == 'adhesion_requests' else '' }}">Demandes d'adhésion{% if pending.adhesion_requests %}<span class="nav-badge">{{ pending.adhesion_requests }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_cartes %}<a href="/admin/cartes" class="{{ 'active' if active == 'cartes' else '' }}">Gestion des cartes de membres{% if pending.cartes %}<span class="nav-badge">{{ pending.cartes }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_sondages %}<a href="/admin/sondages/gestion/liste" class="{{ 'active' if active == 'sondages_gestion' else '' }}">Gestion des sondages</a>{% endif %}
+        {% if admin.can_manage_executif %}<a href="/admin/executif" class="{{ 'active' if active == 'executif' else '' }}">Tableau de bord exécutif</a>{% endif %}
+        {% if admin.can_manage_delegations %}<a href="/admin/delegations" class="{{ 'active' if active == 'delegations' else '' }}">Délégations régionales</a>{% endif %}
+        {% if admin.can_manage_historique %}<a href="/admin/historique" class="{{ 'active' if active == 'historique' else '' }}">Historique des présidents</a>{% endif %}
+        {% if admin.can_manage_fondateurs %}<a href="/admin/fondateurs" class="{{ 'active' if active == 'fondateurs' else '' }}">Membres fondateurs</a>{% endif %}
+        {% if admin.can_manage_gouvernance %}<a href="/admin/gouvernance" class="{{ 'active' if active == 'gouvernance' else '' }}">Gouvernance (photos du BEN)</a>{% endif %}
+        {% if admin.can_manage_gouvernance %}<a href="/admin/conseil-administration" class="{{ 'active' if active == 'conseil_administration' else '' }}">Conseil d'administration</a>{% endif %}
+        {% if admin.can_manage_gouvernance %}<a href="/admin/historique-postes" class="{{ 'active' if active == 'historique_postes' else '' }}">Historique des postes du BEN</a>{% endif %}
+      </div>
+      {% endif %}
+
+      {% if admin.can_manage_enseignants or admin.can_manage_resultats_examens or admin.can_manage_effectifs or admin.can_manage_cartes_scolaires or admin.can_manage_finances or admin.can_manage_messagerie or admin.can_manage_visites %}
+      <div class="nav-section">
+        <span class="nav-section-title">Écoles membres</span>
+        {% if admin.can_manage_finances %}<a href="/admin/etablissements" class="{{ 'active' if active == 'etablissements' else '' }}">Établissements &amp; partenaires</a>{% endif %}
+        {% if admin.can_manage_enseignants %}<a href="/admin/enseignants" class="{{ 'active' if active == 'enseignants' else '' }}">Répertoire des enseignants</a>{% endif %}
+        {% if admin.can_manage_resultats_examens %}<a href="/admin/resultats-examens" class="{{ 'active' if active == 'resultats_examens' else '' }}">Résultats aux examens</a>{% endif %}
+        {% if admin.can_manage_effectifs %}<a href="/admin/effectifs" class="{{ 'active' if active == 'effectifs' else '' }}">Effectifs des élèves</a>{% endif %}
+        {% if admin.can_manage_cartes_scolaires %}<a href="/admin/cartes-scolaires" class="{{ 'active' if active == 'cartes_scolaires' else '' }}">Cartes scolaires{% if pending.cartes_scolaires %}<span class="nav-badge">{{ pending.cartes_scolaires }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_finances %}<a href="/admin/demandes-etablissements" class="{{ 'active' if active == 'demandes_etablissements' else '' }}">Demandes des établissements{% if pending.demandes_etablissements %}<span class="nav-badge">{{ pending.demandes_etablissements }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_messagerie %}<a href="/admin/messagerie" class="{{ 'active' if active == 'messagerie' else '' }}">Messagerie établissements{% if pending.messagerie %}<span class="nav-badge">{{ pending.messagerie }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_visites %}<a href="/admin/visites" class="{{ 'active' if active == 'visites' else '' }}">Journal des visites</a>{% endif %}
+      </div>
+      {% endif %}
+
+      {% if admin.can_manage_finances %}
+      <div class="nav-section">
+        <span class="nav-section-title">Finances</span>
+        <a href="/admin/finances" class="{{ 'active' if active == 'finances' else '' }}">Finances</a>
+        <a href="/admin/dons" class="{{ 'active' if active == 'dons' else '' }}">Dons déclarés{% if pending.dons %}<span class="nav-badge">{{ pending.dons }}</span>{% endif %}</a>
+      </div>
+      {% endif %}
+
+      {% if admin.can_manage_documents or admin.can_manage_photos or admin.can_manage_news or admin.can_manage_activities or admin.can_manage_contact or admin.can_manage_publications or admin.can_manage_site_content or admin.can_manage_courrier %}
+      <div class="nav-section">
+        <span class="nav-section-title">Communication &amp; site vitrine</span>
+        {% if admin.can_manage_documents %}<a href="/admin/documents" class="{{ 'active' if active == 'documents' else '' }}">Documents &amp; PV</a>{% endif %}
+        {% if admin.can_manage_courrier %}<a href="/admin/courrier" class="{{ 'active' if active == 'courrier' else '' }}">Registre du courrier</a>{% endif %}
+        {% if admin.can_manage_photos %}<a href="/admin/photos" class="{{ 'active' if active == 'photos' else '' }}">Galerie photo</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/videos" class="{{ 'active' if active == 'videos' else '' }}">Vidéothèque</a>{% endif %}
+        {% if admin.can_manage_news %}<a href="/admin/news" class="{{ 'active' if active == 'news' else '' }}">Actualités du site</a>{% endif %}
+        {% if admin.can_manage_news %}<a href="/admin/flash-info" class="{{ 'active' if active == 'flash_info' else '' }}">Bande d'informations flash</a>{% endif %}
+        {% if admin.can_manage_activities %}<a href="/admin/activities" class="{{ 'active' if active == 'activities' else '' }}">Activités du site</a>{% endif %}
+        {% if admin.can_manage_activities %}<a href="/admin/calendrier-scolaire" class="{{ 'active' if active == 'calendrier_scolaire' else '' }}">Calendrier scolaire national</a>{% endif %}
+        {% if admin.can_manage_contact %}<a href="/admin/messages" class="{{ 'active' if active == 'messages' else '' }}">Messages de contact</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/publications" class="{{ 'active' if active == 'publications' else '' }}">Publications du site</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/faq" class="{{ 'active' if active == 'faq' else '' }}">FAQ</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/objectifs-principes-moyens" class="{{ 'active' if active == 'opm' else '' }}">Objectifs, principes &amp; moyens</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/temoignages" class="{{ 'active' if active == 'temoignages' else '' }}">Témoignages</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/sondages-express" class="{{ 'active' if active == 'sondages_express' else '' }}">Sondages express</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/newsletter" class="{{ 'active' if active == 'newsletter' else '' }}">Newsletter</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/ressources-pedagogiques" class="{{ 'active' if active == 'ressources' else '' }}">Bibliothèque pédagogique{% if pending.ressources %}<span class="nav-badge">{{ pending.ressources }}</span>{% endif %}</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/ressources-officielles" class="{{ 'active' if active == 'ressources_officielles' else '' }}">Manuels &amp; programmes officiels</a>{% endif %}
+        {% if admin.can_manage_site_content %}<a href="/admin/site-content" class="{{ 'active' if active == 'site_content' else '' }}">Contenu du site</a>{% endif %}
+        {% if admin.can_manage_publications %}<a href="/admin/statistiques" class="{{ 'active' if active == 'statistiques' else '' }}">Statistiques de fréquentation</a>{% endif %}
+      </div>
+      {% endif %}
+
+      {% if admin.can_manage_partenaires or admin.can_manage_projets_patrimoine or admin.can_manage_affaires_sociales %}
+      <div class="nav-section">
+        <span class="nav-section-title">Relations extérieures &amp; projets</span>
+        {% if admin.can_manage_partenaires %}<a href="/admin/partenaires" class="{{ 'active' if active == 'partenaires' else '' }}">Relations extérieures</a>{% endif %}
+        {% if admin.can_manage_projets_patrimoine %}<a href="/admin/projets" class="{{ 'active' if active in ['projets', 'patrimoine'] else '' }}">Projets &amp; patrimoine</a>{% endif %}
+        {% if admin.can_manage_affaires_sociales %}<a href="/admin/social" class="{{ 'active' if active == 'social' else '' }}">Affaires sociales</a>{% endif %}
+      </div>
+      {% endif %}
+
+      {% if admin.is_admin %}
+      <div class="nav-section">
+        <span class="nav-section-title">Administration</span>
+        <a href="/admin/users" class="{{ 'active' if active == 'users' else '' }}">Comptes &amp; accès</a>
+        <a href="/admin/audit" class="{{ 'active' if active == 'audit' else '' }}">Journal d'audit</a>
+        <a href="/admin/connexions" class="{{ 'active' if active == 'connexions' else '' }}">Journal des connexions</a>
+        <a href="/admin/reinitialisations" class="{{ 'active' if active == 'reinitialisations' else '' }}">Réinitialisations de mot de passe</a>
+        <a href="/admin/backups" class="{{ 'active' if active == 'backups' else '' }}">Sauvegardes</a>
+        <a href="/admin/systeme" class="{{ 'active' if active == 'systeme' else '' }}">Santé du système</a>
+      </div>
+      {% endif %}
+    </nav>
+    <div class="logout">
+      <a href="/admin/logout">Se déconnecter</a>
+    </div>
+  </aside>
+  <main class="main">
+    {% if admin.is_observer %}
+    <div style="background:#fff3cd; color:#664d03; border:1px solid #ffe69c; border-radius:8px; padding:10px 16px; margin-bottom:20px; font-size:0.85rem; font-weight:600;">
+      👁 Mode observateur — vous consultez cet espace en lecture seule, aucune modification n'est possible.
+    </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script>
+(function () {
+  var toggle = document.getElementById("admin-nav-toggle");
+  var sidebar = document.getElementById("admin-sidebar");
+  var overlay = document.getElementById("admin-sidebar-overlay");
+  if (!toggle || !sidebar || !overlay) return;
+  function close() {
+    sidebar.classList.remove("open");
+    overlay.classList.remove("open");
+    toggle.setAttribute("aria-expanded", "false");
+  }
+  toggle.addEventListener("click", function () {
+    var willOpen = !sidebar.classList.contains("open");
+    sidebar.classList.toggle("open", willOpen);
+    overlay.classList.toggle("open", willOpen);
+    toggle.setAttribute("aria-expanded", willOpen ? "true" : "false");
+  });
+  overlay.addEventListener("click", close);
+  sidebar.addEventListener("click", function (e) {
+    if (e.target.closest("a")) close();
+  });
+})();
+</script>
+<script>
+(function () {
+  var input = document.getElementById("admin-search-input");
+  var results = document.getElementById("admin-search-results");
+  if (!input || !results) return;
+
+  var TYPE_LABELS = {
+    courrier: "Courrier", tache: "Tâche", ecole: "École",
+    actualite: "Actualité", document: "Document", faq: "FAQ",
+  };
+
+  function escapeHtml(s) {
+    return String(s || "").replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  var timer = null;
+  input.addEventListener("input", function () {
+    clearTimeout(timer);
+    var term = input.value.trim();
+    if (term.length < 2) {
+      results.classList.remove("open");
+      results.innerHTML = "";
+      return;
+    }
+    timer = setTimeout(function () {
+      fetch("/api/admin-search?q=" + encodeURIComponent(term), { credentials: "same-origin" })
+        .then(function (res) { return res.ok ? res.json() : []; })
+        .then(function (items) {
+          if (!items || !items.length) {
+            results.innerHTML = '<div class="admin-search-empty">Aucun résultat</div>';
+          } else {
+            results.innerHTML = items.map(function (item) {
+              return (
+                '<a class="admin-search-result" href="' + item.url + '">' +
+                '<span class="type">' + escapeHtml(TYPE_LABELS[item.type] || item.type) + "</span>" +
+                '<div class="title">' + escapeHtml(item.title) + "</div>" +
+                (item.subtitle ? '<div class="subtitle">' + escapeHtml(item.subtitle) + "</div>" : "") +
+                "</a>"
+              );
+            }).join("");
+          }
+          results.classList.add("open");
+        })
+        .catch(function () { results.classList.remove("open"); });
+    }, 300);
+  });
+
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest(".admin-search")) results.classList.remove("open");
+  });
+})();
+</script>
+{% if admin.is_observer %}
+<script>
+document.addEventListener("submit", function (e) {
+  var form = e.target;
+  if (form.tagName === "FORM" && (form.getAttribute("method") || "get").toLowerCase() === "post") {
+    e.preventDefault();
+    alert("Votre compte est en mode observateur (lecture seule). Aucune modification n'est autorisée.");
+  }
+}, true);
+</script>
+{% endif %}
+</body>
+</html>

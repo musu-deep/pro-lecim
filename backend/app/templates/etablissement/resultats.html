@@ -1,0 +1,66 @@
+{% extends "etablissement/base.html" %}
+{% block title %}Résultats aux examens{% endblock %}
+{% block content %}
+<h1>Résultats aux examens</h1>
+<p style="color:var(--text-muted); margin-top:-14px;">Déclarez vous-même les résultats de votre établissement. Chaque déclaration est vérifiée par le Bureau Exécutif National avant publication sur le site.</p>
+
+<div class="form-card" style="max-width:560px; margin-bottom:24px;">
+  <strong style="display:block; margin-bottom:14px;">Déclarer un résultat</strong>
+  <form method="post" action="/etablissement/resultats/new">
+    <div class="form-group">
+      <label for="annee_scolaire">Année scolaire</label>
+      <input type="text" id="annee_scolaire" name="annee_scolaire" required placeholder="Ex : 2025-2026" value="{{ annee_par_defaut }}">
+    </div>
+    <div class="form-group">
+      <label for="type_examen">Examen</label>
+      <select id="type_examen" name="type_examen" required>
+        {% for t in types_examen %}
+        <option value="{{ t }}">{{ t }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="nombre_inscrits">Nombre d'inscrits</label>
+      <input type="number" id="nombre_inscrits" name="nombre_inscrits" min="0" required value="0">
+    </div>
+    <div class="form-group">
+      <label for="nombre_admis">Nombre d'admis</label>
+      <input type="number" id="nombre_admis" name="nombre_admis" min="0" required value="0">
+    </div>
+    <div class="form-group">
+      <label for="nombre_admis_garcons">Dont garçons admis</label>
+      <input type="number" id="nombre_admis_garcons" name="nombre_admis_garcons" min="0" value="0">
+    </div>
+    <div class="form-group">
+      <label for="nombre_admis_filles">Dont filles admises</label>
+      <input type="number" id="nombre_admis_filles" name="nombre_admis_filles" min="0" value="0">
+    </div>
+    <button type="submit" class="btn btn-primary">Déclarer ce résultat</button>
+  </form>
+</div>
+
+{% if items %}
+<table>
+  <thead><tr><th>Année</th><th>Examen</th><th>Inscrits</th><th>Admis</th><th>Dont garçons</th><th>Dont filles</th><th>Taux</th><th>Statut</th></tr></thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.annee_scolaire }}</td>
+      <td>{{ item.type_examen }}</td>
+      <td>{{ item.nombre_inscrits }}</td>
+      <td>{{ item.nombre_admis }}</td>
+      <td>{{ item.nombre_admis_garcons }}</td>
+      <td>{{ item.nombre_admis_filles }}</td>
+      <td><strong>{{ item.taux_reussite }}%</strong></td>
+      <td>
+        {% if item.is_published %}<span class="pill pill-green">Publié sur le site</span>
+        {% else %}<span class="pill pill-muted">En attente de validation par le BEN</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty-state">Aucun résultat déclaré pour votre établissement pour le moment.</div>
+{% endif %}
+{% endblock %}

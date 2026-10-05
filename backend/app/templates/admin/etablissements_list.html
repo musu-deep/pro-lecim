@@ -1,0 +1,101 @@
+{% extends "admin/base.html" %}
+{% block title %}Établissements &amp; partenaires{% endblock %}
+{% block content %}
+{% set filter_qs = [] %}
+{% if selected_bureau_local %}{% set _ = filter_qs.append('bureau_local=' ~ selected_bureau_local|urlencode) %}{% endif %}
+{% if selected_categorie %}{% set _ = filter_qs.append('categorie=' ~ selected_categorie|urlencode) %}{% endif %}
+{% if selected_district %}{% set _ = filter_qs.append('district=' ~ selected_district|urlencode) %}{% endif %}
+{% if selected_region %}{% set _ = filter_qs.append('region=' ~ selected_region|urlencode) %}{% endif %}
+<div class="topbar">
+  <h1 style="margin:0">Établissements &amp; partenaires ({{ items|length }})</h1>
+  <div style="display:flex; gap:8px;">
+    <a href="/admin/etablissements/export.xlsx{% if filter_qs %}?{{ filter_qs|join('&') }}{% endif %}" class="btn btn-outline">Exporter en Excel{% if filter_qs %} (filtré){% endif %}</a>
+    <a href="/admin/etablissements/export.csv" class="btn btn-outline">Exporter en CSV</a>
+    <a href="/admin/etablissements/new" class="btn btn-primary">+ Ajouter un établissement</a>
+  </div>
+</div>
+<p style="margin-top:-12px;"><a href="/admin/finances">&larr; Retour aux finances</a></p>
+
+{% if error %}
+<div class="empty-state" style="background:#fdecea; color:#c0392b;">{{ error }}</div>
+{% endif %}
+
+<form method="get" action="/admin/etablissements" style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; align-items:flex-end;">
+  <div class="form-group" style="margin:0;">
+    <label for="district">District</label>
+    <select id="district" name="district" onchange="this.form.submit()">
+      <option value="">Tous</option>
+      {% for d in districts %}
+      <option value="{{ d }}" {% if selected_district == d %}selected{% endif %}>{{ d }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group" style="margin:0;">
+    <label for="region">Région</label>
+    <select id="region" name="region" onchange="this.form.submit()">
+      <option value="">Toutes</option>
+      {% for r in regions %}
+      <option value="{{ r }}" {% if selected_region == r %}selected{% endif %}>{{ r }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group" style="margin:0;">
+    <label for="bureau_local">Commune / ville</label>
+    <select id="bureau_local" name="bureau_local" onchange="this.form.submit()">
+      <option value="">Toutes</option>
+      {% for b in bureaux_locaux %}
+      <option value="{{ b }}" {% if selected_bureau_local == b %}selected{% endif %}>{{ b }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group" style="margin:0;">
+    <label for="categorie">Catégorie</label>
+    <select id="categorie" name="categorie" onchange="this.form.submit()">
+      <option value="">Toutes</option>
+      <option value="membre" {% if selected_categorie == "membre" %}selected{% endif %}>Membres affiliés</option>
+      <option value="partenaire" {% if selected_categorie == "partenaire" %}selected{% endif %}>Partenaires</option>
+    </select>
+  </div>
+  {% if selected_bureau_local or selected_categorie or selected_district or selected_region %}
+  <a href="/admin/etablissements" class="btn btn-outline btn-sm">Réinitialiser</a>
+  {% endif %}
+</form>
+
+{% if items %}
+<table>
+  <thead>
+    <tr><th>Code</th><th>Nom</th><th>Catégorie</th><th>District</th><th>Région</th><th>Commune</th><th>Statut</th><th>Adhésion</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.code_adhesion or "—" }}</td>
+      <td>{{ item.nom }}</td>
+      <td>
+        {% if item.categorie == "partenaire" %}<span class="pill pill-gold">Partenaire</span>
+        {% else %}<span class="pill pill-muted">Membre affilié</span>{% endif %}
+      </td>
+      <td>{{ item.district or "—" }}</td>
+      <td>{{ item.region or "—" }}</td>
+      <td>{{ item.bureau_local or "—" }}</td>
+      <td>
+        {% if item.statut == "subventionne" %}<span class="pill pill-gold">Subventionné</span>
+        {% else %}<span class="pill pill-muted">Non subventionné</span>{% endif %}
+      </td>
+      <td>{{ item.date_adhesion.strftime("%d/%m/%Y") if item.date_adhesion else "—" }}</td>
+      <td class="actions-cell">
+        <a href="/admin/etablissements/{{ item.id }}/compte" class="btn btn-outline btn-sm">Espace établissement</a>
+        <a href="/admin/etablissements/{{ item.id }}/attestation/pdf" class="btn btn-outline btn-sm" target="_blank">Attestation</a>
+        <a href="/admin/etablissements/{{ item.id }}/edit" class="btn btn-outline btn-sm">Modifier</a>
+        <form method="post" action="/admin/etablissements/{{ item.id }}/delete" onsubmit="return confirm('Retirer {{ item.nom }} des établissements affiliés ?');">
+          <button type="submit" class="btn btn-danger btn-sm">Retirer</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty-state">Aucun établissement affilié pour le moment.</div>
+{% endif %}
+{% endblock %}

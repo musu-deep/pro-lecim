@@ -1,0 +1,1713 @@
+"""Rapports financiers (PDF) et export des transactions (CSV) pour les financiers de la LECIM."""
+
+import csv
+import datetime
+import io
+from pathlib import Path
+
+import qrcode
+from fpdf import FPDF
+from fpdf.fonts import FontFace
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
+
+from . import models
+from .config import settings
+from .finances_constants import RECETTE_CATEGORIES
+from .security_utils import csv_safe
+
+LOGO_PATH = Path(__file__).resolve().parent / "static" / "img" / "logo.jpg"
+
+
+def _add_logo(pdf: FPDF) -> None:
+    if LOGO_PATH.exists():
+        pdf.image(str(LOGO_PATH), x=pdf.w - pdf.r_margin - 22, y=8, w=22, h=22)
+
+
+def _register_rapport(
+    db: Session,
+    type_rapport: str,
+    titre: str,
+    periode_label: str,
+    total_entrees: int | None,
+    total_depenses: int | None,
+    solde: int | None,
+    user: "models.User",
+) -> "models.RapportGenere":
+    """Enregistre une trace de ce rapport pour permettre sa vérification publique,
+    et lui attribue un code de référence."""
+    rapport = models.RapportGenere(
+        type_rapport=type_rapport,
+        titre=titre,
+        periode_label=periode_label,
+        total_entrees=total_entrees,
+        total_depenses=total_depenses,
+        solde=solde,
+        genere_par_id=user.id,
+    )
+    db.add(rapport)
+    db.flush()
+    rapport.code = f"RAP-{datetime.date.today().year}-{rapport.id:05d}"
+    db.commit()
+    return rapport
+
+
+def _report_verification_footer(pdf: FPDF, code: str) -> None:
+    """Ajoute un QR code de vérification en pied du rapport, à la suite du contenu
+    (le rapport étant multi-page, on ne peut pas ancrer un pied de page fixe)."""
+    verify_url = f"{settings.public_base_url}/verify-rapport/{code}"
+    if pdf.get_y() + 40 > pdf.page_break_trigger:
+        pdf.add_page()
+    pdf.ln(8)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+    pdf.ln(4)
+
+    qr_img = qrcode.make(verify_url, border=1)
+    qr_size = 22.0
+    qr_x = pdf.l_margin
+    qr_y = pdf.get_y()
+    pdf.image(qr_img.get_image() if hasattr(qr_img, "get_image") else qr_img, x=qr_x, y=qr_y, w=qr_size, h=qr_size)
+
+    pdf.set_xy(qr_x + qr_size + 6, qr_y + 3)
+    pdf.set_font("Helvetica", "B", 9.5)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 5, f"Reference du rapport : {code}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(qr_x + qr_size + 6)
+    pdf.set_font("Helvetica", "", 8.5)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 5, "Scannez ce code pour verifier l'authenticite de ce rapport.", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_y(qr_y + qr_size + 4)
+
+
+def current_annee_scolaire(today: datetime.date | None = None) -> str:
+    today = today or datetime.date.today()
+    if today.month >= 9:
+        return f"{today.year}-{today.year + 1}"
+    return f"{today.year - 1}-{today.year}"
+
+
+def money(value: int) -> str:
+    return f"{value:,}".replace(",", " ") + " FCFA"
+
+
+_PDF_CHAR_REPLACEMENTS = {
+    "—": "-",  # em dash
+    "–": "-",  # en dash
+    "‘": "'",
+    "’": "'",
+    "“": '"',
+    "”": '"',
+    "…": "...",
+    "•": "-",
+}
+
+
+def pdf_safe(text: str | None) -> str:
+    """Remplace les caractères typographiques hors Latin-1 (tirets cadratins,
+    guillemets courbes, etc.) que la police Helvetica de base ne sait pas rendre, puis
+    remplace tout caractère Latin-1 restant (ex: écriture arabe dans le nom d'une
+    madrassa) par « ? » plutôt que de laisser fpdf2 lever une exception et faire
+    échouer tout le document — mieux vaut un nom partiellement illisible qu'un rapport
+    qui ne se génère pas du tout."""
+    if not text:
+        return ""
+    for char, replacement in _PDF_CHAR_REPLACEMENTS.items():
+        text = text.replace(char, replacement)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def etablissements_en_retard(db: Session, annee_scolaire: str | None = None) -> list[dict]:
+    """Établissements dont la cotisation de l'année scolaire n'est pas soldée."""
+    annee_scolaire = annee_scolaire or current_annee_scolaire()
+    etablissements = db.query(models.Etablissement).order_by(models.Etablissement.nom).all()
+    cotisations = {
+        c.etablissement_id: c
+        for c in db.query(models.Cotisation)
+        .filter(models.Cotisation.annee_scolaire == annee_scolaire)
+        .all()
+    }
+    en_retard = []
+    for e in etablissements:
+        cotisation = cotisations.get(e.id)
+        if cotisation is None:
+            from .finances_constants import cotisation_rule
+
+            rule = cotisation_rule(e.statut)
+            en_retard.append(
+                {
+                    "etablissement": e,
+                    "montant_du": rule["montant_du"],
+                    "montant_paye": 0,
+                    "reste": rule["montant_du"],
+                }
+            )
+        elif cotisation.statut_paiement != "paye":
+            en_retard.append(
+                {
+                    "etablissement": e,
+                    "montant_du": cotisation.montant_du,
+                    "montant_paye": cotisation.montant_paye,
+                    "reste": cotisation.montant_du - cotisation.montant_paye,
+                }
+            )
+    return en_retard
+
+
+def etablissements_engagees_ids(db: Session, annee_scolaire: str | None = None) -> set[int]:
+    """Établissements considérés "engagés" pour le badge automatique : cotisation de
+    l'année scolaire soldée ET effectif déclaré pour cette même année — distinct du
+    badge "École modèle" (accordé manuellement par le BEN)."""
+    annee_scolaire = annee_scolaire or current_annee_scolaire()
+    cotisations_a_jour = {
+        c.etablissement_id
+        for c in db.query(models.Cotisation)
+        .filter(models.Cotisation.annee_scolaire == annee_scolaire)
+        .all()
+        if c.statut_paiement == "paye"
+    }
+    effectifs_declares = {
+        e.etablissement_id
+        for e in db.query(models.Effectif.etablissement_id)
+        .filter(models.Effectif.annee_scolaire == annee_scolaire)
+        .distinct()
+        .all()
+    }
+    return cotisations_a_jour & effectifs_declares
+
+
+def multi_year_financial_summary(db: Session) -> list[dict]:
+    """Totaux financiers regroupés par année scolaire, toutes années confondues,
+    pour visualiser l'évolution pluriannuelle des finances de la LECIM."""
+    buckets: dict[str, dict] = {}
+
+    def bucket(annee: str) -> dict:
+        return buckets.setdefault(
+            annee,
+            {"adhesions": 0, "cotisations": 0, "recettes": 0, "ventes_livres": 0, "droits_examens": 0, "depenses": 0},
+        )
+
+    for a in db.query(models.Adhesion).all():
+        bucket(current_annee_scolaire(a.date_paiement))["adhesions"] += a.montant
+    for c in db.query(models.Cotisation).filter(models.Cotisation.date_paiement.isnot(None)).all():
+        bucket(c.annee_scolaire)["cotisations"] += c.montant_paye
+    for r in db.query(models.Recette).all():
+        bucket(current_annee_scolaire(r.date))["recettes"] += r.montant
+    for v in db.query(models.VenteLivre).all():
+        bucket(current_annee_scolaire(v.date))["ventes_livres"] += v.montant
+    for de in db.query(models.DroitExamen).all():
+        bucket(current_annee_scolaire(de.date))["droits_examens"] += de.montant
+    for d in db.query(models.Depense).all():
+        bucket(current_annee_scolaire(d.date))["depenses"] += d.montant
+
+    result = []
+    for annee in sorted(buckets.keys()):
+        b = buckets[annee]
+        total_entrees = b["adhesions"] + b["cotisations"] + b["recettes"] + b["ventes_livres"] + b["droits_examens"]
+        result.append(
+            {
+                "annee": annee,
+                "adhesions": b["adhesions"],
+                "cotisations": b["cotisations"],
+                "recettes": b["recettes"],
+                "ventes_livres": b["ventes_livres"],
+                "droits_examens": b["droits_examens"],
+                "depenses": b["depenses"],
+                "total_entrees": total_entrees,
+                "solde": total_entrees - b["depenses"],
+            }
+        )
+    return result
+
+
+def cotisations_by_year(db: Session) -> list[dict]:
+    """Évolution des cotisations (dû/versé) par année scolaire — distinct de
+    multi_year_financial_summary qui ne retient que les montants effectivement versés,
+    mêlés aux autres recettes. Se base sur le champ `annee_scolaire` de la cotisation
+    elle-même plutôt que sur la date de paiement, afin d'inclure aussi les cotisations
+    encore impayées (date_paiement NULL)."""
+    rows = (
+        db.query(
+            models.Cotisation.annee_scolaire,
+            func.coalesce(func.sum(models.Cotisation.montant_du), 0),
+            func.coalesce(func.sum(models.Cotisation.montant_paye), 0),
+        )
+        .group_by(models.Cotisation.annee_scolaire)
+        .all()
+    )
+    result = []
+    for annee, montant_du, montant_paye in sorted(rows, key=lambda r: r[0]):
+        result.append({
+            "annee": annee,
+            "montant_du": montant_du,
+            "montant_paye": montant_paye,
+            "taux_recouvrement": round(montant_paye / montant_du * 100, 1) if montant_du else None,
+        })
+    return result
+
+
+def etablissements_growth_by_year(db: Session) -> list[dict]:
+    """Évolution du nombre d'établissements affiliés, regroupés par année scolaire
+    d'adhésion — pour visualiser la croissance du réseau dans le temps sur le tableau
+    de bord exécutif. Les établissements sans date d'adhésion renseignée (champ
+    nullable, fiches anciennes) n'apparaissent pas dans la chronologie, uniquement
+    dans le total actuel affiché ailleurs sur le tableau de bord."""
+    dates = [
+        row[0] for row in db.query(models.Etablissement.date_adhesion)
+        .filter(models.Etablissement.date_adhesion.isnot(None))
+        .all()
+    ]
+    nouveaux_par_annee: dict[str, int] = {}
+    for d in dates:
+        annee = current_annee_scolaire(d)
+        nouveaux_par_annee[annee] = nouveaux_par_annee.get(annee, 0) + 1
+
+    result = []
+    cumule = 0
+    for annee in sorted(nouveaux_par_annee.keys()):
+        cumule += nouveaux_par_annee[annee]
+        result.append({"annee": annee, "nouveaux": nouveaux_par_annee[annee], "cumule": cumule})
+    return result
+
+
+def comparatif_regions(db: Session, annee_scolaire: str | None = None) -> list[dict]:
+    """Vue comparative multi-indicateurs par région (écoles affiliées, effectifs
+    déclarés, taux de réussite aux examens) — distincte du baromètre existant qui
+    ne compare que les résultats d'examens, et qui regroupe par bureau_local
+    (commune) plutôt que par région. Les établissements sans région renseignée
+    (`region` est un champ texte libre nullable) sont exclus de la comparaison."""
+    annee_scolaire = annee_scolaire or current_annee_scolaire()
+
+    ecoles_rows = (
+        db.query(models.Etablissement.region, func.count(models.Etablissement.id))
+        .filter(models.Etablissement.region.isnot(None))
+        .group_by(models.Etablissement.region)
+        .all()
+    )
+    effectifs_rows = (
+        db.query(
+            models.Etablissement.region,
+            func.coalesce(func.sum(models.Effectif.nombre_garcons + models.Effectif.nombre_filles), 0),
+        )
+        .join(models.Etablissement, models.Etablissement.id == models.Effectif.etablissement_id)
+        .filter(models.Etablissement.region.isnot(None), models.Effectif.annee_scolaire == annee_scolaire)
+        .group_by(models.Etablissement.region)
+        .all()
+    )
+    examens_rows = (
+        db.query(
+            models.Etablissement.region,
+            func.coalesce(func.sum(models.ResultatExamen.nombre_inscrits), 0),
+            func.coalesce(func.sum(models.ResultatExamen.nombre_admis), 0),
+        )
+        .join(models.Etablissement, models.Etablissement.id == models.ResultatExamen.etablissement_id)
+        .filter(
+            models.Etablissement.region.isnot(None),
+            models.ResultatExamen.is_published.is_(True),
+            models.ResultatExamen.annee_scolaire == annee_scolaire,
+        )
+        .group_by(models.Etablissement.region)
+        .all()
+    )
+
+    buckets: dict[str, dict] = {}
+
+    def bucket(region: str) -> dict:
+        return buckets.setdefault(region, {"ecoles": 0, "effectifs": 0, "inscrits": 0, "admis": 0})
+
+    for region, count in ecoles_rows:
+        bucket(region)["ecoles"] = count
+    for region, total in effectifs_rows:
+        bucket(region)["effectifs"] = total
+    for region, inscrits, admis in examens_rows:
+        bucket(region)["inscrits"] = inscrits
+        bucket(region)["admis"] = admis
+
+    result = []
+    for region in sorted(buckets.keys()):
+        b = buckets[region]
+        result.append({
+            "region": region,
+            "ecoles": b["ecoles"],
+            "effectifs": b["effectifs"],
+            "inscrits": b["inscrits"],
+            "admis": b["admis"],
+            "taux_reussite": round(b["admis"] / b["inscrits"] * 100, 1) if b["inscrits"] else None,
+        })
+    return result
+
+
+def _period_data(db: Session, date_debut: datetime.date, date_fin: datetime.date) -> dict:
+    adhesions = (
+        db.query(models.Adhesion)
+        .options(joinedload(models.Adhesion.etablissement))
+        .filter(models.Adhesion.date_paiement >= date_debut, models.Adhesion.date_paiement <= date_fin)
+        .all()
+    )
+    cotisations = (
+        db.query(models.Cotisation)
+        .options(joinedload(models.Cotisation.etablissement))
+        .filter(
+            models.Cotisation.date_paiement.isnot(None),
+            models.Cotisation.date_paiement >= date_debut,
+            models.Cotisation.date_paiement <= date_fin,
+        )
+        .all()
+    )
+    recettes = (
+        db.query(models.Recette)
+        .filter(models.Recette.date >= date_debut, models.Recette.date <= date_fin)
+        .all()
+    )
+    ventes_livres = (
+        db.query(models.VenteLivre)
+        .filter(models.VenteLivre.date >= date_debut, models.VenteLivre.date <= date_fin)
+        .all()
+    )
+    droits_examens = (
+        db.query(models.DroitExamen)
+        .options(joinedload(models.DroitExamen.etablissement))
+        .filter(models.DroitExamen.date >= date_debut, models.DroitExamen.date <= date_fin)
+        .all()
+    )
+    depenses = (
+        db.query(models.Depense)
+        .filter(models.Depense.date >= date_debut, models.Depense.date <= date_fin)
+        .all()
+    )
+
+    total_adhesions = sum(a.montant for a in adhesions)
+    total_cotisations = sum(c.montant_paye for c in cotisations)
+    total_recettes = sum(r.montant for r in recettes)
+    total_ventes_livres = sum(v.montant for v in ventes_livres)
+    total_droits_examens = sum(d.montant for d in droits_examens)
+    total_depenses = sum(d.montant for d in depenses)
+
+    recettes_par_categorie: dict[str, int] = {}
+    for r in recettes:
+        recettes_par_categorie[r.categorie] = recettes_par_categorie.get(r.categorie, 0) + r.montant
+
+    total_entrees = total_adhesions + total_cotisations + total_recettes + total_ventes_livres + total_droits_examens
+
+    return {
+        "adhesions": adhesions,
+        "cotisations": cotisations,
+        "recettes": recettes,
+        "ventes_livres": ventes_livres,
+        "droits_examens": droits_examens,
+        "depenses": depenses,
+        "total_adhesions": total_adhesions,
+        "total_cotisations": total_cotisations,
+        "total_recettes": total_recettes,
+        "total_ventes_livres": total_ventes_livres,
+        "total_droits_examens": total_droits_examens,
+        "total_depenses": total_depenses,
+        "recettes_par_categorie": recettes_par_categorie,
+        "total_entrees": total_entrees,
+        "solde_periode": total_entrees - total_depenses,
+    }
+
+
+def _solde_cumule_au(db: Session, date_fin: datetime.date) -> int:
+    total_adhesions = sum(
+        a.montant for a in db.query(models.Adhesion).filter(models.Adhesion.date_paiement <= date_fin)
+    )
+    total_cotisations = sum(
+        c.montant_paye
+        for c in db.query(models.Cotisation).filter(
+            models.Cotisation.date_paiement.isnot(None), models.Cotisation.date_paiement <= date_fin
+        )
+    )
+    total_recettes = sum(r.montant for r in db.query(models.Recette).filter(models.Recette.date <= date_fin))
+    total_ventes_livres = sum(
+        v.montant for v in db.query(models.VenteLivre).filter(models.VenteLivre.date <= date_fin)
+    )
+    total_droits_examens = sum(
+        d.montant for d in db.query(models.DroitExamen).filter(models.DroitExamen.date <= date_fin)
+    )
+    total_depenses = sum(d.montant for d in db.query(models.Depense).filter(models.Depense.date <= date_fin))
+    return (
+        total_adhesions + total_cotisations + total_recettes + total_ventes_livres + total_droits_examens
+        - total_depenses
+    )
+
+
+GREEN = (15, 122, 76)
+GOLD = (224, 165, 44)
+GRAY = (170, 170, 170)
+
+
+def _short_money(value: int) -> str:
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return str(value)
+
+
+def _draw_bar_chart(pdf: FPDF, x: float, y: float, width: float, height: float, bars: list[tuple]) -> None:
+    """Dessine un histogramme simple. bars: liste de (label, valeur, couleur_rgb)."""
+    if not bars:
+        return
+    max_val = max((abs(b[1]) for b in bars), default=0) or 1
+    n = len(bars)
+    gap = 6
+    bar_width = (width - gap * (n - 1)) / n
+
+    pdf.set_draw_color(*GRAY)
+    pdf.line(x, y + height, x + width, y + height)
+
+    for i, (label, value, color) in enumerate(bars):
+        bar_h = (abs(value) / max_val) * (height - 8)
+        bx = x + i * (bar_width + gap)
+        by = y + height - bar_h
+        pdf.set_fill_color(*color)
+        pdf.rect(bx, by, bar_width, bar_h, style="F")
+
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_xy(bx - 5, by - 5)
+        pdf.cell(bar_width + 10, 5, _short_money(value), align="C")
+
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(80, 80, 80)
+        pdf.set_xy(bx - 5, y + height + 1.5)
+        pdf.cell(bar_width + 10, 5, label, align="C")
+
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_xy(x, y + height + 8)
+
+
+def _draw_grouped_bar_chart(
+    pdf: FPDF,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    groups: list[str],
+    serie_a: list[int],
+    serie_b: list[int],
+    label_a: str,
+    label_b: str,
+) -> None:
+    """Histogramme groupé à deux séries (comparaison de deux périodes)."""
+    n = len(groups)
+    max_val = max([abs(v) for v in serie_a + serie_b] or [0]) or 1
+    group_gap = 10
+    group_width = (width - group_gap * (n - 1)) / n
+    bar_gap = 2
+    bar_width = (group_width - bar_gap) / 2
+
+    pdf.set_draw_color(*GRAY)
+    pdf.line(x, y + height, x + width, y + height)
+
+    for i, label in enumerate(groups):
+        gx = x + i * (group_width + group_gap)
+        for j, (value, color) in enumerate(((serie_a[i], GREEN), (serie_b[i], GOLD))):
+            bar_h = (abs(value) / max_val) * (height - 8)
+            bx = gx + j * (bar_width + bar_gap)
+            by = y + height - bar_h
+            pdf.set_fill_color(*color)
+            pdf.rect(bx, by, bar_width, bar_h, style="F")
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_text_color(30, 30, 30)
+            pdf.set_xy(bx - 6, by - 5)
+            pdf.cell(bar_width + 12, 5, _short_money(value), align="C")
+
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(80, 80, 80)
+        pdf.set_xy(gx, y + height + 1.5)
+        pdf.cell(group_width, 5, label, align="C")
+
+    legend_y = y + height + 9
+    pdf.set_fill_color(*GREEN)
+    pdf.rect(x, legend_y, 4, 4, style="F")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_xy(x + 6, legend_y - 1.5)
+    pdf.cell(60, 6, label_a)
+
+    pdf.set_fill_color(*GOLD)
+    pdf.rect(x + 70, legend_y, 4, 4, style="F")
+    pdf.set_xy(x + 76, legend_y - 1.5)
+    pdf.cell(60, 6, label_b)
+
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_text_color(30, 30, 30)
+    pdf.set_xy(x, legend_y + 8)
+
+
+def generate_financial_report_pdf(
+    db: Session, date_debut: datetime.date, date_fin: datetime.date, user: "models.User"
+) -> bytes:
+    data = _period_data(db, date_debut, date_fin)
+    solde_cumule = _solde_cumule_au(db, date_fin)
+    retards = etablissements_en_retard(db)
+    generated_by = user.full_name
+
+    periode_label = f"{date_debut.strftime('%d/%m/%Y')} au {date_fin.strftime('%d/%m/%Y')}"
+    rapport = _register_rapport(
+        db, "periode", "Rapport financier", periode_label,
+        data["total_entrees"], data["total_depenses"], data["solde_periode"], user,
+    )
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, "LECIM - Rapport financier", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(80, 80, 80)
+    periode = f"Periode du {date_debut.strftime('%d/%m/%Y')} au {date_fin.strftime('%d/%m/%Y')}"
+    pdf.cell(0, 7, periode, new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 7, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} par {generated_by}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    def section_title(text: str) -> None:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(11, 61, 46)
+        pdf.cell(0, 9, text, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+
+    def kv_row(label: str, value: str, bold: bool = False) -> None:
+        pdf.set_font("Helvetica", "B" if bold else "", 11)
+        pdf.cell(100, 7, label)
+        pdf.cell(0, 7, value, new_x="LMARGIN", new_y="NEXT")
+
+    section_title("Resume de la periode")
+    kv_row("Droits d'adhesion encaisses", money(data["total_adhesions"]))
+    kv_row("Cotisations encaissees", money(data["total_cotisations"]))
+    kv_row("Autres recettes", money(data["total_recettes"]))
+    kv_row("Ventes de livres", money(data["total_ventes_livres"]))
+    kv_row("Droits d'examens", money(data["total_droits_examens"]))
+    kv_row("Total des entrees", money(data["total_entrees"]), bold=True)
+    kv_row("Depenses", money(data["total_depenses"]))
+    kv_row("Solde de la periode", money(data["solde_periode"]), bold=True)
+    pdf.ln(2)
+    kv_row("Solde cumule au " + date_fin.strftime("%d/%m/%Y"), money(solde_cumule), bold=True)
+    pdf.ln(10)
+
+    _draw_bar_chart(
+        pdf,
+        pdf.l_margin,
+        pdf.get_y(),
+        pdf.w - pdf.l_margin - pdf.r_margin,
+        40,
+        [
+            ("Entrees", data["total_entrees"], GREEN),
+            ("Depenses", data["total_depenses"], GOLD),
+            ("Solde periode", data["solde_periode"], GREEN if data["solde_periode"] >= 0 else (192, 57, 43)),
+        ],
+    )
+    pdf.ln(4)
+
+    if data["recettes_par_categorie"]:
+        section_title("Autres recettes par categorie")
+        chart_bars = [
+            (RECETTE_CATEGORIES.get(cat, cat)[:14], montant, GOLD)
+            for cat, montant in data["recettes_par_categorie"].items()
+        ]
+        _draw_bar_chart(pdf, pdf.l_margin, pdf.get_y(), pdf.w - pdf.l_margin - pdf.r_margin, 36, chart_bars)
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(110, 60), text_align=("LEFT", "RIGHT")) as table:
+            row = table.row()
+            row.cell("Categorie", style=FontFace(emphasis="BOLD"))
+            row.cell("Montant", style=FontFace(emphasis="BOLD"))
+            for categorie, montant in data["recettes_par_categorie"].items():
+                row = table.row()
+                row.cell(RECETTE_CATEGORIES.get(categorie, categorie))
+                row.cell(money(montant))
+        pdf.ln(4)
+
+    if data["ventes_livres"]:
+        section_title("Ventes de livres sur la periode")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(40, 90, 30, 40), text_align=("LEFT", "LEFT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Date", "Titre", "Quantite", "Montant"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for v in data["ventes_livres"]:
+                row = table.row()
+                row.cell(v.date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(v.titre))
+                row.cell(str(v.quantite))
+                row.cell(money(v.montant))
+        pdf.ln(4)
+
+    if data["droits_examens"]:
+        section_title("Droits d'examens sur la periode")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(35, 60, 45, 40), text_align=("LEFT", "LEFT", "LEFT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Date", "Libelle", "Etablissement", "Montant"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for de in data["droits_examens"]:
+                row = table.row()
+                row.cell(de.date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(de.libelle))
+                row.cell(pdf_safe(de.etablissement.nom) if de.etablissement else "-")
+                row.cell(money(de.montant))
+        pdf.ln(4)
+
+    if data["cotisations"]:
+        section_title("Cotisations encaissees sur la periode")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(70, 40, 40, 40), text_align=("LEFT", "LEFT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Etablissement", "Annee scolaire", "Verse", "Part bureau local"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for c in data["cotisations"]:
+                row = table.row()
+                row.cell(pdf_safe(c.etablissement.nom))
+                row.cell(c.annee_scolaire)
+                row.cell(money(c.montant_paye))
+                row.cell(money(c.part_bureau_local))
+        pdf.ln(4)
+
+    if data["depenses"]:
+        section_title("Depenses de la periode")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(40, 100, 50), text_align=("LEFT", "LEFT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Date", "Libelle", "Montant"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for d in data["depenses"]:
+                row = table.row()
+                row.cell(d.date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(d.libelle))
+                row.cell(money(d.montant))
+        pdf.ln(4)
+
+    if retards:
+        section_title(f"Etablissements en retard de cotisation ({current_annee_scolaire()})")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(70, 40, 40, 40), text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Etablissement", "Du", "Verse", "Reste"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in retards:
+                row = table.row()
+                row.cell(pdf_safe(r["etablissement"].nom))
+                row.cell(money(r["montant_du"]))
+                row.cell(money(r["montant_paye"]))
+                row.cell(money(r["reste"]))
+
+    _report_verification_footer(pdf, rapport.code)
+    return bytes(pdf.output())
+
+
+def generate_annual_report_pdf(
+    db: Session, annee_scolaire: str, date_debut: datetime.date, date_fin: datetime.date, user: "models.User"
+) -> bytes:
+    """Rapport d'activites annuel consolide (reunions, activites, finances, cartes,
+    delegations) destine a l'Assemblee Generale."""
+    finances = _period_data(db, date_debut, date_fin)
+    solde_cumule = _solde_cumule_au(db, date_fin)
+    retards = etablissements_en_retard(db, annee_scolaire)
+    generated_by = user.full_name
+
+    rapport = _register_rapport(
+        db, "annuel", "Rapport d'activités annuel", f"Année scolaire {annee_scolaire}",
+        finances["total_entrees"], finances["total_depenses"], finances["solde_periode"], user,
+    )
+
+    reunions = (
+        db.query(models.Reunion)
+        .filter(
+            models.Reunion.delegation_id.is_(None),
+            models.Reunion.date >= date_debut,
+            models.Reunion.date <= date_fin,
+        )
+        .order_by(models.Reunion.date)
+        .all()
+    )
+    activites = (
+        db.query(models.Activity)
+        .filter(models.Activity.event_date >= date_debut, models.Activity.event_date <= date_fin)
+        .order_by(models.Activity.event_date)
+        .all()
+    )
+    cartes_emises = (
+        db.query(models.CarteMembre)
+        .filter(
+            models.CarteMembre.status == "disponible",
+            models.CarteMembre.date_disponibilite.isnot(None),
+            models.CarteMembre.date_disponibilite >= datetime.datetime.combine(date_debut, datetime.time.min),
+            models.CarteMembre.date_disponibilite <= datetime.datetime.combine(date_fin, datetime.time.max),
+        )
+        .count()
+    )
+    delegations = db.query(models.Delegation).order_by(models.Delegation.nom).all()
+    etablissements_total = db.query(models.Etablissement).count()
+    growth_data = etablissements_growth_by_year(db)
+    regions_data = comparatif_regions(db, annee_scolaire)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, "LECIM - Rapport d'activites annuel", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 7, f"Annee scolaire {annee_scolaire} (Assemblee Generale)", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 7, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} par {generated_by}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    def section_title(text: str) -> None:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(11, 61, 46)
+        pdf.cell(0, 9, text, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+
+    def kv_row(label: str, value: str, bold: bool = False) -> None:
+        pdf.set_font("Helvetica", "B" if bold else "", 11)
+        pdf.cell(100, 7, label)
+        pdf.cell(0, 7, value, new_x="LMARGIN", new_y="NEXT")
+
+    section_title("Vue d'ensemble")
+    kv_row("Reunions du Bureau Executif National tenues", str(len(reunions)))
+    kv_row("Activites organisees", str(len(activites)))
+    kv_row("Cartes de membres remises", str(cartes_emises))
+    kv_row("Etablissements affilies", str(etablissements_total))
+    kv_row("Delegations regionales actives", str(len(delegations)))
+    pdf.ln(6)
+
+    section_title("Bilan financier de l'annee")
+    kv_row("Droits d'adhesion encaisses", money(finances["total_adhesions"]))
+    kv_row("Cotisations encaissees", money(finances["total_cotisations"]))
+    kv_row("Autres recettes", money(finances["total_recettes"]))
+    kv_row("Ventes de livres", money(finances["total_ventes_livres"]))
+    kv_row("Droits d'examens", money(finances["total_droits_examens"]))
+    kv_row("Total des entrees", money(finances["total_entrees"]), bold=True)
+    kv_row("Depenses", money(finances["total_depenses"]))
+    kv_row("Solde de l'annee", money(finances["solde_periode"]), bold=True)
+    kv_row("Solde cumule au " + date_fin.strftime("%d/%m/%Y"), money(solde_cumule), bold=True)
+    pdf.ln(4)
+
+    _draw_bar_chart(
+        pdf,
+        pdf.l_margin,
+        pdf.get_y(),
+        pdf.w - pdf.l_margin - pdf.r_margin,
+        40,
+        [
+            ("Entrees", finances["total_entrees"], GREEN),
+            ("Depenses", finances["total_depenses"], GOLD),
+            ("Solde", finances["solde_periode"], GREEN if finances["solde_periode"] >= 0 else (192, 57, 43)),
+        ],
+    )
+    pdf.ln(8)
+
+    if reunions:
+        section_title("Reunions du Bureau Executif National")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(35, 90, 40, 25), text_align=("LEFT", "LEFT", "LEFT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Date", "Titre", "Lieu", "Presents"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in reunions:
+                row = table.row()
+                row.cell(r.date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(r.title))
+                row.cell(pdf_safe(r.lieu) or "-")
+                row.cell(f"{r.present_count}/{len(r.presences)}")
+        pdf.ln(6)
+
+    if activites:
+        section_title("Activites organisees")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(35, 150) , text_align=("LEFT", "LEFT")) as table:
+            row = table.row()
+            for h in ("Date", "Titre"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for a in activites:
+                row = table.row()
+                row.cell(a.event_date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(a.title))
+        pdf.ln(6)
+
+    if delegations:
+        section_title("Delegations regionales")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(95, 90), text_align=("LEFT", "LEFT")) as table:
+            row = table.row()
+            for h in ("Delegation", "Region"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for d in delegations:
+                row = table.row()
+                row.cell(pdf_safe(d.nom))
+                row.cell(pdf_safe(d.region) or "-")
+        pdf.ln(6)
+
+    if growth_data:
+        section_title("Evolution du nombre d'etablissements affilies")
+        chart_bars = [(g["annee"], g["cumule"], GREEN) for g in growth_data[-8:]]
+        _draw_bar_chart(pdf, pdf.l_margin, pdf.get_y(), pdf.w - pdf.l_margin - pdf.r_margin, 36, chart_bars)
+        pdf.ln(8)
+
+    if regions_data:
+        section_title("Comparatif par region")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(50, 30, 35, 30, 30, 30), text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Region", "Ecoles", "Effectifs", "Inscrits", "Admis", "Taux"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in regions_data:
+                row = table.row()
+                row.cell(pdf_safe(r["region"]))
+                row.cell(str(r["ecoles"]))
+                row.cell(str(r["effectifs"]))
+                row.cell(str(r["inscrits"]))
+                row.cell(str(r["admis"]))
+                row.cell(f"{r['taux_reussite']:.1f}%" if r["taux_reussite"] is not None else "-")
+        pdf.ln(6)
+
+    if retards:
+        section_title(f"Etablissements en retard de cotisation ({annee_scolaire})")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(70, 40, 40, 40), text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Etablissement", "Du", "Verse", "Reste"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in retards:
+                row = table.row()
+                row.cell(pdf_safe(r["etablissement"].nom))
+                row.cell(money(r["montant_du"]))
+                row.cell(money(r["montant_paye"]))
+                row.cell(money(r["reste"]))
+
+    _report_verification_footer(pdf, rapport.code)
+    return bytes(pdf.output())
+
+
+def _period_data_delegation(db: Session, date_debut: datetime.date, date_fin: datetime.date, delegation_id: int) -> dict:
+    """Variante de _period_data() limitee aux etablissements d'une delegation donnee.
+    Recettes/ventes de livres/depenses ne sont pas rattachees a un etablissement dans ce
+    modele (ce sont des ecritures nationales) : elles sont volontairement exclues plutot
+    que faussement attribuees a une delegation."""
+    adhesions = (
+        db.query(models.Adhesion)
+        .join(models.Etablissement, models.Etablissement.id == models.Adhesion.etablissement_id)
+        .options(joinedload(models.Adhesion.etablissement))
+        .filter(
+            models.Etablissement.delegation_id == delegation_id,
+            models.Adhesion.date_paiement >= date_debut,
+            models.Adhesion.date_paiement <= date_fin,
+        )
+        .all()
+    )
+    cotisations = (
+        db.query(models.Cotisation)
+        .join(models.Etablissement, models.Etablissement.id == models.Cotisation.etablissement_id)
+        .options(joinedload(models.Cotisation.etablissement))
+        .filter(
+            models.Etablissement.delegation_id == delegation_id,
+            models.Cotisation.date_paiement.isnot(None),
+            models.Cotisation.date_paiement >= date_debut,
+            models.Cotisation.date_paiement <= date_fin,
+        )
+        .all()
+    )
+    droits_examens = (
+        db.query(models.DroitExamen)
+        .join(models.Etablissement, models.Etablissement.id == models.DroitExamen.etablissement_id)
+        .options(joinedload(models.DroitExamen.etablissement))
+        .filter(
+            models.Etablissement.delegation_id == delegation_id,
+            models.DroitExamen.date >= date_debut,
+            models.DroitExamen.date <= date_fin,
+        )
+        .all()
+    )
+
+    total_adhesions = sum(a.montant for a in adhesions)
+    total_cotisations = sum(c.montant_paye for c in cotisations)
+    total_droits_examens = sum(d.montant for d in droits_examens)
+    total_entrees = total_adhesions + total_cotisations + total_droits_examens
+
+    return {
+        "adhesions": adhesions,
+        "cotisations": cotisations,
+        "droits_examens": droits_examens,
+        "total_adhesions": total_adhesions,
+        "total_cotisations": total_cotisations,
+        "total_droits_examens": total_droits_examens,
+        "total_entrees": total_entrees,
+    }
+
+
+def generate_delegation_report_pdf(
+    db: Session,
+    delegation: "models.Delegation",
+    annee_scolaire: str,
+    date_debut: datetime.date,
+    date_fin: datetime.date,
+    user: "models.User",
+) -> bytes:
+    """Rapport PDF individualise pour une delegation regionale — equivalent allege du
+    rapport annuel national (generate_annual_report_pdf), limite a ce que le modele de
+    donnees permet reellement de rattacher a une delegation : reunions locales,
+    etablissements affilies, droits d'adhesion/cotisations/droits d'examens de ces
+    etablissements, retards de cotisation. Pas de section Activites (Activity n'a pas de
+    notion de delegation) ni Recettes/Ventes de livres/Depenses (ecritures nationales,
+    non rattachees a un etablissement) — volontairement absentes plutot qu'approximees."""
+    finances = _period_data_delegation(db, date_debut, date_fin, delegation.id)
+    etablissements = (
+        db.query(models.Etablissement)
+        .filter(models.Etablissement.delegation_id == delegation.id)
+        .order_by(models.Etablissement.nom)
+        .all()
+    )
+    retards = [
+        r for r in etablissements_en_retard(db, annee_scolaire)
+        if r["etablissement"].delegation_id == delegation.id
+    ]
+    reunions = (
+        db.query(models.Reunion)
+        .filter(
+            models.Reunion.delegation_id == delegation.id,
+            models.Reunion.date >= date_debut,
+            models.Reunion.date <= date_fin,
+        )
+        .order_by(models.Reunion.date)
+        .all()
+    )
+    membres_count = db.query(models.Membre).filter(models.Membre.delegation_id == delegation.id).count()
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, f"LECIM - Rapport de la delegation {pdf_safe(delegation.nom)}", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 7, f"Annee scolaire {annee_scolaire}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 7, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} par {user.full_name}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    def section_title(text: str) -> None:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(11, 61, 46)
+        pdf.cell(0, 9, text, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+
+    def kv_row(label: str, value: str, bold: bool = False) -> None:
+        pdf.set_font("Helvetica", "B" if bold else "", 11)
+        pdf.cell(100, 7, label)
+        pdf.cell(0, 7, value, new_x="LMARGIN", new_y="NEXT")
+
+    section_title("Vue d'ensemble")
+    kv_row("Etablissements affilies", str(len(etablissements)))
+    kv_row("Membres locaux", str(membres_count))
+    kv_row("Reunions tenues sur la periode", str(len(reunions)))
+    pdf.ln(6)
+
+    section_title("Bilan financier de la periode")
+    kv_row("Droits d'adhesion encaisses", money(finances["total_adhesions"]))
+    kv_row("Cotisations encaissees", money(finances["total_cotisations"]))
+    kv_row("Droits d'examens", money(finances["total_droits_examens"]))
+    kv_row("Total des entrees rattachees aux etablissements", money(finances["total_entrees"]), bold=True)
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(130, 130, 130)
+    pdf.cell(0, 6, "(hors recettes, ventes de livres et depenses, qui sont des ecritures nationales)", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(30, 30, 30)
+    pdf.ln(4)
+
+    if reunions:
+        section_title("Reunions de la delegation")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(35, 90, 40, 25), text_align=("LEFT", "LEFT", "LEFT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Date", "Titre", "Lieu", "Presents"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in reunions:
+                row = table.row()
+                row.cell(r.date.strftime("%d/%m/%Y"))
+                row.cell(pdf_safe(r.title))
+                row.cell(pdf_safe(r.lieu) or "-")
+                row.cell(f"{r.present_count}/{len(r.presences)}")
+        pdf.ln(6)
+
+    if etablissements:
+        section_title("Etablissements affilies")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(120, 70), text_align=("LEFT", "LEFT")) as table:
+            row = table.row()
+            for h in ("Etablissement", "Statut"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for e in etablissements:
+                row = table.row()
+                row.cell(pdf_safe(e.nom))
+                row.cell(pdf_safe(e.statut))
+        pdf.ln(6)
+
+    if retards:
+        section_title(f"Etablissements en retard de cotisation ({annee_scolaire})")
+        pdf.set_font("Helvetica", "", 10)
+        with pdf.table(col_widths=(70, 40, 40, 40), text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT")) as table:
+            row = table.row()
+            for h in ("Etablissement", "Du", "Verse", "Reste"):
+                row.cell(h, style=FontFace(emphasis="BOLD"))
+            for r in retards:
+                row = table.row()
+                row.cell(pdf_safe(r["etablissement"].nom))
+                row.cell(money(r["montant_du"]))
+                row.cell(money(r["montant_paye"]))
+                row.cell(money(r["reste"]))
+
+    return bytes(pdf.output())
+
+
+def generate_impact_report_pdf(db: Session, annee_scolaire: str) -> bytes:
+    """Rapport d'impact grand public — chiffres clés de l'année scolaire, sans le
+    détail comptable ligne par ligne du rapport interne (generate_annual_report_pdf) :
+    destiné aux partenaires, donateurs et au grand public, pas au BEN."""
+    etablissements_total = db.query(models.Etablissement).count()
+    enseignants_total = db.query(models.Enseignant).count()
+    delegations_total = db.query(models.Delegation).count()
+
+    eleves = (
+        db.query(
+            func.coalesce(func.sum(models.Effectif.nombre_garcons), 0),
+            func.coalesce(func.sum(models.Effectif.nombre_filles), 0),
+        )
+        .filter(models.Effectif.annee_scolaire == annee_scolaire)
+        .first()
+    )
+    eleves_garcons, eleves_filles = eleves[0], eleves[1]
+    eleves_total = eleves_garcons + eleves_filles
+
+    resultats = (
+        db.query(
+            func.coalesce(func.sum(models.ResultatExamen.nombre_inscrits), 0),
+            func.coalesce(func.sum(models.ResultatExamen.nombre_admis), 0),
+        )
+        .filter(models.ResultatExamen.annee_scolaire == annee_scolaire, models.ResultatExamen.is_published.is_(True))
+        .first()
+    )
+    inscrits, admis = resultats[0], resultats[1]
+    taux_reussite = round((admis / inscrits) * 100, 1) if inscrits else None
+
+    finances_par_annee = {d["annee"]: d for d in multi_year_financial_summary(db)}
+    finances = finances_par_annee.get(annee_scolaire, {})
+    ressources_mobilisees = finances.get("total_entrees", 0)
+
+    activites = (
+        db.query(models.Activity)
+        .filter(
+            models.Activity.event_date >= datetime.date(int(annee_scolaire[:4]), 9, 1),
+            models.Activity.event_date <= datetime.date(int(annee_scolaire[:4]) + 1, 8, 31),
+        )
+        .order_by(models.Activity.event_date)
+        .all()
+    )
+
+    # Évolution pluriannuelle du nombre d'élèves scolarisés, pour un graphique.
+    eleves_par_annee_rows = (
+        db.query(
+            models.Effectif.annee_scolaire,
+            func.coalesce(func.sum(models.Effectif.nombre_garcons + models.Effectif.nombre_filles), 0),
+        )
+        .group_by(models.Effectif.annee_scolaire)
+        .order_by(models.Effectif.annee_scolaire)
+        .all()
+    )
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_text_color(*GREEN)
+    pdf.cell(0, 12, "LECIM - Rapport d'impact", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 12)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 8, f"Annee scolaire {annee_scolaire}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Document public - genere le {datetime.date.today().strftime('%d/%m/%Y')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(30, 30, 30)
+    pdf.multi_cell(
+        0, 6,
+        "La Ligue des Etablissements Confessionnels et Madrassas en Cote d'Ivoire (LECIM) "
+        "presente ici les chiffres cles de son action au service de l'education islamique "
+        "durant l'annee scolaire ecoulee.",
+    )
+    pdf.ln(6)
+
+    def stat_card(x: float, y: float, w: float, value: str, label: str) -> None:
+        pdf.set_xy(x, y)
+        pdf.set_fill_color(244, 248, 251)
+        pdf.set_draw_color(220, 232, 240)
+        pdf.rect(x, y, w, 30, style="DF")
+        pdf.set_xy(x, y + 5)
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.set_text_color(*GREEN)
+        pdf.cell(w, 9, value, align="C")
+        pdf.set_xy(x, y + 16)
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(90, 90, 90)
+        pdf.multi_cell(w, 4, label, align="C")
+
+    card_y = pdf.get_y()
+    card_w = (pdf.w - pdf.l_margin - pdf.r_margin - 20) / 3
+    stat_card(pdf.l_margin, card_y, card_w, str(etablissements_total), "Etablissements affilies")
+    stat_card(pdf.l_margin + card_w + 10, card_y, card_w, f"{eleves_total:,}".replace(",", " "), f"Eleves scolarises ({annee_scolaire})")
+    stat_card(pdf.l_margin + 2 * (card_w + 10), card_y, card_w, str(enseignants_total), "Enseignants recenses")
+    pdf.set_y(card_y + 38)
+
+    card_y = pdf.get_y()
+    stat_card(pdf.l_margin, card_y, card_w, f"{taux_reussite} %" if taux_reussite is not None else "-", "Taux de reussite aux examens")
+    stat_card(pdf.l_margin + card_w + 10, card_y, card_w, str(delegations_total), "Delegations regionales")
+    stat_card(pdf.l_margin + 2 * (card_w + 10), card_y, card_w, money(ressources_mobilisees), "Ressources mobilisees")
+    pdf.set_y(card_y + 44)
+
+    if len(eleves_par_annee_rows) > 1:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*GREEN)
+        pdf.cell(0, 9, "Evolution du nombre d'eleves scolarises", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+        _draw_bar_chart(
+            pdf, pdf.l_margin, pdf.get_y(),
+            pdf.w - pdf.l_margin - pdf.r_margin, 40,
+            [(annee, total, GREEN) for annee, total in eleves_par_annee_rows],
+        )
+        pdf.ln(6)
+
+    if activites:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*GREEN)
+        pdf.cell(0, 9, "Temps forts de l'annee", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 30)
+        for a in activites[:12]:
+            pdf.cell(0, 6, f"- {a.event_date.strftime('%d/%m/%Y')} : {pdf_safe(a.title)}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(
+        0, 5,
+        "Ce document presente une synthese publique des indicateurs de la LECIM. Pour le detail "
+        "financier complet, se referer aux rapports internes verifiables aupres du Bureau Executif National.",
+    )
+
+    return bytes(pdf.output())
+
+
+def _variation(a: int, b: int) -> str:
+    diff = b - a
+    sign = "+" if diff >= 0 else ""
+    if a == 0:
+        pct = "-" if b == 0 else "+100%" if b > 0 else "-100%"
+    else:
+        pct = f"{sign}{(diff / abs(a)) * 100:.0f}%"
+    return f"{sign}{money(diff)} ({pct})"
+
+
+def generate_comparative_report_pdf(
+    db: Session,
+    date_debut_a: datetime.date,
+    date_fin_a: datetime.date,
+    date_debut_b: datetime.date,
+    date_fin_b: datetime.date,
+    user: "models.User",
+    label_a: str = "Periode A",
+    label_b: str = "Periode B",
+) -> bytes:
+    data_a = _period_data(db, date_debut_a, date_fin_a)
+    data_b = _period_data(db, date_debut_b, date_fin_b)
+    generated_by = user.full_name
+
+    periode_label = (
+        f"{label_a} ({date_debut_a.strftime('%d/%m/%Y')} au {date_fin_a.strftime('%d/%m/%Y')}) "
+        f"vs {label_b} ({date_debut_b.strftime('%d/%m/%Y')} au {date_fin_b.strftime('%d/%m/%Y')})"
+    )
+    rapport = _register_rapport(
+        db, "comparatif", "Rapport financier comparatif", periode_label,
+        data_b["total_entrees"], data_b["total_depenses"], data_b["solde_periode"], user,
+    )
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, "LECIM - Rapport financier comparatif", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(
+        0, 7,
+        f"{label_a} : {date_debut_a.strftime('%d/%m/%Y')} au {date_fin_a.strftime('%d/%m/%Y')}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.cell(
+        0, 7,
+        f"{label_b} : {date_debut_b.strftime('%d/%m/%Y')} au {date_fin_b.strftime('%d/%m/%Y')}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.cell(
+        0, 7, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} par {generated_by}",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    def section_title(text: str) -> None:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(11, 61, 46)
+        pdf.cell(0, 9, text, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+
+    section_title("Comparaison des totaux")
+    pdf.set_font("Helvetica", "", 10)
+    rows = [
+        ("Droits d'adhesion", data_a["total_adhesions"], data_b["total_adhesions"]),
+        ("Cotisations", data_a["total_cotisations"], data_b["total_cotisations"]),
+        ("Autres recettes", data_a["total_recettes"], data_b["total_recettes"]),
+        ("Ventes de livres", data_a["total_ventes_livres"], data_b["total_ventes_livres"]),
+        ("Droits d'examens", data_a["total_droits_examens"], data_b["total_droits_examens"]),
+        ("Total des entrees", data_a["total_entrees"], data_b["total_entrees"]),
+        ("Depenses", data_a["total_depenses"], data_b["total_depenses"]),
+        ("Solde de la periode", data_a["solde_periode"], data_b["solde_periode"]),
+    ]
+    with pdf.table(col_widths=(60, 40, 40, 55), text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT")) as table:
+        row = table.row()
+        for h in ("Indicateur", label_a, label_b, "Ecart"):
+            row.cell(h, style=FontFace(emphasis="BOLD"))
+        for label, val_a, val_b in rows:
+            row = table.row()
+            row.cell(label)
+            row.cell(money(val_a))
+            row.cell(money(val_b))
+            row.cell(_variation(val_a, val_b))
+    pdf.ln(10)
+
+    section_title("Entrees / Depenses / Solde")
+    _draw_grouped_bar_chart(
+        pdf,
+        pdf.l_margin,
+        pdf.get_y(),
+        pdf.w - pdf.l_margin - pdf.r_margin,
+        42,
+        ["Entrees", "Depenses", "Solde"],
+        [data_a["total_entrees"], data_a["total_depenses"], data_a["solde_periode"]],
+        [data_b["total_entrees"], data_b["total_depenses"], data_b["solde_periode"]],
+        label_a,
+        label_b,
+    )
+    pdf.ln(6)
+
+    categories = sorted(set(data_a["recettes_par_categorie"]) | set(data_b["recettes_par_categorie"]))
+    if categories:
+        section_title("Autres recettes par categorie")
+        serie_a = [data_a["recettes_par_categorie"].get(c, 0) for c in categories]
+        serie_b = [data_b["recettes_par_categorie"].get(c, 0) for c in categories]
+        _draw_grouped_bar_chart(
+            pdf,
+            pdf.l_margin,
+            pdf.get_y(),
+            pdf.w - pdf.l_margin - pdf.r_margin,
+            42,
+            [RECETTE_CATEGORIES.get(c, c)[:12] for c in categories],
+            serie_a,
+            serie_b,
+            label_a,
+            label_b,
+        )
+        pdf.ln(6)
+
+    _report_verification_footer(pdf, rapport.code)
+    return bytes(pdf.output())
+
+
+def export_transactions_csv(db: Session, date_debut: datetime.date, date_fin: datetime.date) -> str:
+    data = _period_data(db, date_debut, date_fin)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["Date", "Type", "Categorie", "Libelle / Etablissement", "Montant (FCFA)"])
+
+    for a in data["adhesions"]:
+        writer.writerow([a.date_paiement.isoformat(), "Adhesion", "-", csv_safe(a.etablissement.nom), a.montant])
+    for c in data["cotisations"]:
+        writer.writerow(
+            [c.date_paiement.isoformat(), "Cotisation", c.annee_scolaire, csv_safe(c.etablissement.nom), c.montant_paye]
+        )
+    for r in data["recettes"]:
+        writer.writerow(
+            [r.date.isoformat(), "Recette", RECETTE_CATEGORIES.get(r.categorie, r.categorie), csv_safe(r.libelle), r.montant]
+        )
+    for v in data["ventes_livres"]:
+        writer.writerow([v.date.isoformat(), "Vente de livre", f"Qte {v.quantite}", csv_safe(v.titre), v.montant])
+    for de in data["droits_examens"]:
+        writer.writerow([
+            de.date.isoformat(), "Droit d'examen", de.type_examen or "-",
+            csv_safe(de.libelle + (f" ({de.etablissement.nom})" if de.etablissement else "")), de.montant,
+        ])
+    for d in data["depenses"]:
+        writer.writerow([d.date.isoformat(), "Depense", "-", csv_safe(d.libelle), -d.montant])
+
+    return buffer.getvalue()
+
+
+def export_resultats_csv(db: Session) -> str:
+    items = (
+        db.query(models.ResultatExamen)
+        .options(joinedload(models.ResultatExamen.etablissement))
+        .order_by(models.ResultatExamen.annee_scolaire.desc(), models.ResultatExamen.id.desc())
+        .all()
+    )
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["Annee scolaire", "Etablissement", "Examen", "Inscrits", "Admis", "Dont garcons", "Dont filles", "Taux de reussite (%)", "Publie"])
+    for r in items:
+        writer.writerow([
+            r.annee_scolaire, csv_safe(r.etablissement.nom), r.type_examen,
+            r.nombre_inscrits, r.nombre_admis, r.nombre_admis_garcons, r.nombre_admis_filles,
+            r.taux_reussite, "Oui" if r.is_published else "Non",
+        ])
+    return buffer.getvalue()
+
+
+def export_effectifs_csv(db: Session) -> str:
+    items = (
+        db.query(models.Effectif)
+        .options(joinedload(models.Effectif.etablissement))
+        .order_by(models.Effectif.annee_scolaire.desc(), models.Effectif.niveau)
+        .all()
+    )
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";")
+    writer.writerow(["Annee scolaire", "Etablissement", "Niveau", "Garcons", "Filles", "Total"])
+    for e in items:
+        writer.writerow([e.annee_scolaire, csv_safe(e.etablissement.nom), e.niveau_label, e.nombre_garcons, e.nombre_filles, e.total])
+    return buffer.getvalue()
+
+
+def export_transactions_xlsx(db: Session, date_debut: datetime.date, date_fin: datetime.date) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    data = _period_data(db, date_debut, date_fin)
+
+    wb = Workbook()
+
+    header_fill = PatternFill(start_color="0B3D2E", end_color="0B3D2E", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    title_font = Font(color="0B3D2E", bold=True, size=14)
+    bold_font = Font(bold=True)
+
+    # ---------- Feuille Résumé ----------
+    resume = wb.active
+    resume.title = "Résumé"
+    resume["A1"] = "LECIM — Rapport financier"
+    resume["A1"].font = title_font
+    resume["A2"] = f"Période du {date_debut.strftime('%d/%m/%Y')} au {date_fin.strftime('%d/%m/%Y')}"
+
+    if LOGO_PATH.exists():
+        from openpyxl.drawing.image import Image as XLImage
+
+        xl_logo = XLImage(str(LOGO_PATH))
+        xl_logo.width = 60
+        xl_logo.height = 60
+        resume.add_image(xl_logo, "D1")
+
+    resume_rows = [
+        ("Droits d'adhésion encaissés", data["total_adhesions"]),
+        ("Cotisations encaissées", data["total_cotisations"]),
+        ("Autres recettes", data["total_recettes"]),
+        ("Ventes de livres", data["total_ventes_livres"]),
+        ("Droits d'examens", data["total_droits_examens"]),
+        ("Total des entrées", data["total_entrees"]),
+        ("Dépenses", data["total_depenses"]),
+        ("Solde de la période", data["solde_periode"]),
+    ]
+    resume["A4"] = "Indicateur"
+    resume["B4"] = "Montant (FCFA)"
+    for cell in ("A4", "B4"):
+        resume[cell].fill = header_fill
+        resume[cell].font = header_font
+    for i, (label, value) in enumerate(resume_rows, start=5):
+        resume[f"A{i}"] = label
+        resume[f"B{i}"] = value
+        resume[f"B{i}"].number_format = "#,##0"
+        if label in ("Total des entrées", "Solde de la période"):
+            resume[f"A{i}"].font = bold_font
+            resume[f"B{i}"].font = bold_font
+    resume.column_dimensions["A"].width = 32
+    resume.column_dimensions["B"].width = 18
+
+    if data["recettes_par_categorie"]:
+        start_row = 5 + len(resume_rows) + 2
+        resume[f"A{start_row}"] = "Recettes par catégorie"
+        resume[f"A{start_row}"].font = bold_font
+        resume[f"A{start_row + 1}"] = "Catégorie"
+        resume[f"B{start_row + 1}"] = "Montant (FCFA)"
+        for cell in (f"A{start_row + 1}", f"B{start_row + 1}"):
+            resume[cell].fill = header_fill
+            resume[cell].font = header_font
+        row = start_row + 2
+        for categorie, montant in data["recettes_par_categorie"].items():
+            resume[f"A{row}"] = RECETTE_CATEGORIES.get(categorie, categorie)
+            resume[f"B{row}"] = montant
+            resume[f"B{row}"].number_format = "#,##0"
+            row += 1
+
+        chart = BarChart()
+        chart.title = "Recettes par catégorie"
+        chart.y_axis.title = "FCFA"
+        chart.style = 10
+        data_ref = Reference(resume, min_col=2, min_row=start_row + 1, max_row=row - 1)
+        cats_ref = Reference(resume, min_col=1, min_row=start_row + 2, max_row=row - 1)
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart.width = 16
+        chart.height = 9
+        resume.add_chart(chart, f"D{start_row}")
+
+    # ---------- Feuille Transactions ----------
+    sheet = wb.create_sheet("Transactions")
+    headers = ["Date", "Type", "Catégorie", "Libellé / Établissement", "Montant (FCFA)"]
+    sheet.append(headers)
+    for col in range(1, len(headers) + 1):
+        cell = sheet.cell(row=1, column=col)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for a in data["adhesions"]:
+        sheet.append([a.date_paiement, "Adhésion", "-", csv_safe(a.etablissement.nom), a.montant])
+    for c in data["cotisations"]:
+        sheet.append([c.date_paiement, "Cotisation", c.annee_scolaire, csv_safe(c.etablissement.nom), c.montant_paye])
+    for r in data["recettes"]:
+        sheet.append(
+            [r.date, "Recette", RECETTE_CATEGORIES.get(r.categorie, r.categorie), csv_safe(r.libelle), r.montant]
+        )
+    for v in data["ventes_livres"]:
+        sheet.append([v.date, "Vente de livre", f"Qté {v.quantite}", csv_safe(v.titre), v.montant])
+    for de in data["droits_examens"]:
+        sheet.append([
+            de.date, "Droit d'examen", de.type_examen or "-",
+            csv_safe(de.libelle + (f" ({de.etablissement.nom})" if de.etablissement else "")), de.montant,
+        ])
+    for d in data["depenses"]:
+        sheet.append([d.date, "Dépense", "-", csv_safe(d.libelle), -d.montant])
+
+    for row in sheet.iter_rows(min_row=2, min_col=1, max_col=1):
+        row[0].number_format = "DD/MM/YYYY"
+    for row in sheet.iter_rows(min_row=2, min_col=5, max_col=5):
+        row[0].number_format = "#,##0"
+
+    sheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{sheet.max_row}"
+    sheet.column_dimensions["A"].width = 12
+    sheet.column_dimensions["B"].width = 12
+    sheet.column_dimensions["C"].width = 22
+    sheet.column_dimensions["D"].width = 38
+    sheet.column_dimensions["E"].width = 16
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def export_etablissements_xlsx(items: list["models.Etablissement"]) -> bytes:
+    """Export Excel de la liste des établissements affiliés — items déjà filtrés par
+    l'appelant (mêmes filtres région/district/catégorie/commune que la liste admin)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = "Établissements"
+
+    header_fill = PatternFill(start_color="0B3D2E", end_color="0B3D2E", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    headers = [
+        "Code adhésion", "Nom", "Catégorie", "District", "Région", "Commune (bureau local)",
+        "Statut", "Date adhésion", "Téléphone", "E-mail", "Agrément",
+    ]
+    sheet.append(headers)
+    for col in range(1, len(headers) + 1):
+        cell = sheet.cell(row=1, column=col)
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for e in items:
+        sheet.append([
+            e.code_adhesion or "", e.nom,
+            "Partenaire" if e.categorie == "partenaire" else "Membre affilié",
+            e.district or "", e.region or "", e.bureau_local or "",
+            "Subventionné" if e.statut == "subventionne" else "Non subventionné",
+            e.date_adhesion, e.contact_telephone or "", e.contact_email or "", e.numero_agrement or "",
+        ])
+
+    for row in sheet.iter_rows(min_row=2, min_col=8, max_col=8):
+        row[0].number_format = "DD/MM/YYYY"
+
+    sheet.auto_filter.ref = f"A1:{chr(64 + len(headers))}{sheet.max_row}"
+    widths = [16, 32, 16, 18, 16, 22, 18, 14, 16, 26, 16]
+    for i, w in enumerate(widths, start=1):
+        sheet.column_dimensions[chr(64 + i)].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def export_membres_xlsx(items: list["models.Membre"]) -> bytes:
+    """Export Excel du répertoire des membres, usage interne (contient téléphone/e-mail,
+    jamais exposés par le trombinoscope public)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    sheet = wb.active
+    sheet.title = "Membres"
+
+    header_fill = PatternFill(start_color="0B3D2E", end_color="0B3D2E", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    headers = ["Nom", "Poste", "Téléphone", "E-mail", "Début mandat", "Fin mandat", "Statut mandat"]
+    sheet.append(headers)
+    for col in range(1, len(headers) + 1):
+        cell = sheet.cell(row=1, column=col)
+        cell.fill = header_fill
+        cell.font = header_font
+
+    statut_labels = {"expire": "Expiré", "bientot": "Expire bientôt", "en_cours": "En cours"}
+    for m in items:
+        sheet.append([
+            m.full_name, m.poste_label, m.phone or "", m.email or "",
+            m.mandat_debut, m.mandat_fin, statut_labels.get(m.mandat_status, ""),
+        ])
+
+    for row in sheet.iter_rows(min_row=2, min_col=5, max_col=6):
+        for cell in row:
+            cell.number_format = "DD/MM/YYYY"
+
+    sheet.auto_filter.ref = f"A1:{chr(64 + len(headers))}{sheet.max_row}"
+    widths = [28, 30, 18, 28, 14, 14, 16]
+    for i, w in enumerate(widths, start=1):
+        sheet.column_dimensions[chr(64 + i)].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def generate_courrier_registre_pdf(items: list["models.Courrier"], filtre_label: str | None = None) -> bytes:
+    """Export PDF du registre du courrier (arrivée/départ) — document de travail interne,
+    pas de QR de vérification publique contrairement aux rapports financiers (pas de sens
+    pour une simple liste de courriers, et évite d'enregistrer un `RapportGenere` par export)."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, "LECIM - Registre du courrier", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(80, 80, 80)
+    sous_titre = filtre_label or "Toutes les entrées"
+    pdf.cell(0, 6, sous_titre, new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 6, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} - {len(items)} entree(s)",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(30, 30, 30)
+    with pdf.table(
+        col_widths=(18, 28, 22, 42, 65),
+        text_align=("LEFT", "LEFT", "LEFT", "LEFT", "LEFT"),
+    ) as table:
+        row = table.row()
+        for h in ("Type", "Numero", "Date", "Correspondant", "Objet"):
+            row.cell(h, style=FontFace(emphasis="BOLD"))
+        for item in items:
+            row = table.row()
+            row.cell(item.type_label)
+            row.cell(pdf_safe(item.numero))
+            row.cell(item.date_courrier.strftime("%d/%m/%Y"))
+            row.cell(pdf_safe(item.correspondant))
+            row.cell(pdf_safe(item.objet))
+
+    return bytes(pdf.output())
+
+
+def generate_comparatif_regions_pdf(data: list[dict], annee_scolaire: str) -> bytes:
+    """Export PDF du comparatif par region — document de travail interne, meme logique
+    que le registre du courrier (pas de QR de verification publique)."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+    _add_logo(pdf)
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(11, 61, 46)
+    pdf.cell(0, 10, "LECIM - Comparatif par region", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 6, f"Annee scolaire {annee_scolaire}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        0, 6, f"Genere le {datetime.date.today().strftime('%d/%m/%Y')} - {len(data)} region(s)",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(30, 30, 30)
+    with pdf.table(
+        col_widths=(50, 30, 35, 30, 30, 30),
+        text_align=("LEFT", "RIGHT", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
+    ) as table:
+        row = table.row()
+        for h in ("Region", "Ecoles", "Effectifs", "Inscrits", "Admis", "Taux"):
+            row.cell(h, style=FontFace(emphasis="BOLD"))
+        for r in data:
+            row = table.row()
+            row.cell(pdf_safe(r["region"]))
+            row.cell(str(r["ecoles"]))
+            row.cell(str(r["effectifs"]))
+            row.cell(str(r["inscrits"]))
+            row.cell(str(r["admis"]))
+            row.cell(f"{r['taux_reussite']:.1f}%" if r["taux_reussite"] is not None else "-")
+
+    return bytes(pdf.output())

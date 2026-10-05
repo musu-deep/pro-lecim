@@ -1,0 +1,110 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ "Modifier" if item else "Nouvel" }} établissement{% endblock %}
+{% block content %}
+<h1>{{ "Modifier l'établissement" if item else "Ajouter un établissement" }}</h1>
+<div class="form-card">
+  <form method="post" action="{{ '/admin/etablissements/' ~ item.id ~ '/edit' if item else '/admin/etablissements/new' }}" enctype="multipart/form-data">
+    <div class="form-group">
+      <label for="nom">Nom de l'établissement</label>
+      <input type="text" id="nom" name="nom" required value="{{ item.nom if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="code_adhesion">Code d'adhésion LECIM (si connu)</label>
+      <input type="text" id="code_adhesion" name="code_adhesion" placeholder="Ex : LCM1000" value="{{ item.code_adhesion if item and item.code_adhesion else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="directeur_nom">Nom du directeur / responsable</label>
+      <input type="text" id="directeur_nom" name="directeur_nom" value="{{ item.directeur_nom if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="type_enseignement">Niveaux d'enseignement</label>
+      <select id="type_enseignement" name="type_enseignement">
+        <option value="primaire" {% if item and item.type_enseignement == 'primaire' %}selected{% endif %}>Primaire uniquement</option>
+        <option value="secondaire" {% if item and item.type_enseignement == 'secondaire' %}selected{% endif %}>Secondaire uniquement</option>
+        <option value="les_deux" {% if not item or item.type_enseignement == 'les_deux' %}selected{% endif %}>Primaire et secondaire</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="categorie">Catégorie</label>
+      <select id="categorie" name="categorie">
+        <option value="membre" {% if not item or item.categorie == 'membre' %}selected{% endif %}>Membre affilié</option>
+        <option value="partenaire" {% if item and item.categorie == 'partenaire' %}selected{% endif %}>Partenaire</option>
+      </select>
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Membre = adhésion validée, cotisation due. Partenaire = collabore avec la LECIM sans être membre à part entière.</p>
+    </div>
+    <div class="form-group">
+      <label for="numero_agrement">Numéro d'agrément (ministère)</label>
+      <input type="text" id="numero_agrement" name="numero_agrement" value="{{ item.numero_agrement if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="statut_agrement">Statut de l'agrément (affiché publiquement)</label>
+      <select id="statut_agrement" name="statut_agrement">
+        <option value="agree" {% if item and item.statut_agrement == 'agree' %}selected{% endif %}>Agréée</option>
+        <option value="en_cours" {% if not item or item.statut_agrement == 'en_cours' %}selected{% endif %}>Agrément en cours</option>
+        <option value="expire" {% if item and item.statut_agrement == 'expire' %}selected{% endif %}>Agrément expiré</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="date_expiration_agrement">Date d'expiration de l'agrément (si connue)</label>
+      <input type="date" id="date_expiration_agrement" name="date_expiration_agrement" value="{{ item.date_expiration_agrement.isoformat() if item and item.date_expiration_agrement else '' }}">
+    </div>
+    <div class="form-group checkbox-row">
+      <input type="checkbox" id="is_ecole_modele" name="is_ecole_modele" value="true" {% if item and item.is_ecole_modele %}checked{% endif %}>
+      <label for="is_ecole_modele" style="margin:0">École modèle LECIM (label affiché publiquement)</label>
+    </div>
+    <div class="form-group">
+      {% if item and item.logo_url %}
+      <img src="{{ item.logo_url }}" alt="" style="max-width:120px; border-radius:8px; display:block; margin-bottom:10px;">
+      {% endif %}
+      <label for="logo">Logo de l'établissement (affiché sur les cartes scolaires de ses élèves)</label>
+      <input type="file" id="logo" name="logo" accept=".jpg,.jpeg,.png,.webp,.gif">
+      {% if item and item.logo_url %}<p style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Laissez vide pour conserver le logo actuel.</p>{% endif %}
+    </div>
+    <div class="form-group">
+      <label for="bureau_local">Commune / ville (bureau local)</label>
+      <input type="text" id="bureau_local" name="bureau_local" value="{{ item.bureau_local if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="district">District (1 des 2 districts autonomes, ou 1 des 12 districts ordinaires)</label>
+      <input type="text" id="district" name="district" placeholder="Ex : District Autonome d'Abidjan, ou District de la Vallée du Bandama" value="{{ item.district if item and item.district else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="region">Région (1 des 31 régions — uniquement si l'établissement n'est pas à Abidjan ou Yamoussoukro)</label>
+      <input type="text" id="region" name="region" placeholder="Ex : Gbêkê" value="{{ item.region if item and item.region else '' }}">
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:6px;">Pour Abidjan ou Yamoussoukro, ne renseignez que le district. Pour les 12 autres districts, renseignez les deux : le district ET sa région.</p>
+    </div>
+    <div class="form-group">
+      <label for="statut">Statut</label>
+      <select id="statut" name="statut">
+        {% for key, rule in cotisation_rules.items() %}
+        <option value="{{ key }}" {% if item and item.statut == key or (not item and key == 'non_subventionne') %}selected{% endif %}>
+          {{ rule.label }} — cotisation {{ "{:,}".format(rule.montant_du).replace(",", " ") }} FCFA/an
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="date_adhesion">Date d'adhésion (si connue)</label>
+      <input type="date" id="date_adhesion" name="date_adhesion" value="{{ item.date_adhesion.isoformat() if item and item.date_adhesion else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="contact_email">E-mail de contact (pour les relances de cotisation)</label>
+      <input type="email" id="contact_email" name="contact_email" value="{{ item.contact_email if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="contact_telephone">Téléphone de contact</label>
+      <input type="text" id="contact_telephone" name="contact_telephone" value="{{ item.contact_telephone if item else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="latitude">Latitude (pour la carte interactive du site)</label>
+      <input type="text" id="latitude" name="latitude" placeholder="Ex : 5.345" value="{{ item.latitude if item and item.latitude is not none else '' }}">
+    </div>
+    <div class="form-group">
+      <label for="longitude">Longitude</label>
+      <input type="text" id="longitude" name="longitude" placeholder="Ex : -4.024" value="{{ item.longitude if item and item.longitude is not none else '' }}">
+    </div>
+    <button type="submit" class="btn btn-primary">Enregistrer</button>
+    <a href="/admin/etablissements" class="btn btn-outline">Annuler</a>
+  </form>
+</div>
+{% endblock %}
