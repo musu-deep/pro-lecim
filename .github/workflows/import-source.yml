@@ -1,0 +1,38 @@
+name: Import projet-lecim source
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone public source repository
+        run: |
+          git clone --depth 1 https://github.com/tolobayounousaa225-prog/projet-lecim.git /tmp/projet-lecim
+
+      - name: Replace repository contents with source
+        run: |
+          rsync -a --delete --exclude='.git' /tmp/projet-lecim/ ./
+
+      - name: Commit imported project
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Import complete projet-lecim source"
+          git push origin main
