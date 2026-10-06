@@ -2529,3 +2529,18 @@ html[dir="rtl"] button {
     border-color: rgba(255,255,255,.16);
   }
 }
+
+
+/* ===== French hero text alignment ===== */
+html[lang="fr"] .hero.hero-cinematic .hero-text {
+  text-align: left;
+}
+
+html[lang="fr"] .hero.hero-cinematic .hero-text::before {
+  margin-left: 0;
+  margin-right: auto;
+}
+
+html[lang="fr"] .hero.hero-cinematic .hero-actions {
+  justify-content: flex-start;
+}
