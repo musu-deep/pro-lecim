@@ -2341,3 +2341,39 @@ html[dir="rtl"] textarea,
 html[dir="rtl"] select {
   font-family: "Noto Sans Arabic", "Cairo", sans-serif;
 }
+
+
+/* ===== Arabic link typography hardening ===== */
+html[lang="ar"] a,
+html[dir="rtl"] a,
+html[lang="ar"] a *,
+html[dir="rtl"] a *,
+html[lang="ar"] button,
+html[dir="rtl"] button,
+html[lang="ar"] button *,
+html[dir="rtl"] button *,
+html[lang="ar"] .nav,
+html[dir="rtl"] .nav,
+html[lang="ar"] .nav *,
+html[dir="rtl"] .nav *,
+html[lang="ar"] footer,
+html[dir="rtl"] footer,
+html[lang="ar"] footer *,
+html[dir="rtl"] footer *,
+html[lang="ar"] .site-footer,
+html[dir="rtl"] .site-footer,
+html[lang="ar"] .site-footer *,
+html[dir="rtl"] .site-footer *,
+html[lang="ar"] .nav-dropdown,
+html[dir="rtl"] .nav-dropdown,
+html[lang="ar"] .nav-dropdown *,
+html[dir="rtl"] .nav-dropdown * {
+  font-family: "Cairo", "Noto Sans Arabic", Tahoma, Arial, sans-serif !important;
+}
+
+html[lang="ar"] a,
+html[dir="rtl"] a,
+html[lang="ar"] button,
+html[dir="rtl"] button {
+  letter-spacing: 0 !important;
+}
