@@ -2377,3 +2377,86 @@ html[lang="ar"] button,
 html[dir="rtl"] button {
   letter-spacing: 0 !important;
 }
+
+
+/* ===== LECIM hero editorial glass card ===== */
+@media (min-width: 901px) {
+  .hero.hero-cinematic .hero-inner {
+    justify-content: flex-start !important;
+    align-items: center;
+    padding-inline: 5.5vw 4vw;
+  }
+
+  [dir="rtl"] .hero.hero-cinematic .hero-inner {
+    justify-content: flex-start !important;
+  }
+
+  .hero.hero-cinematic .hero-text {
+    width: min(760px, 48vw);
+    min-height: 320px;
+    padding: 34px 42px 36px;
+    border-radius: 22px;
+    background:
+      linear-gradient(135deg, rgba(3,18,31,.58), rgba(3,18,31,.34));
+    border: 1px solid rgba(255,255,255,.20);
+    box-shadow:
+      0 28px 80px rgba(0,0,0,.26),
+      inset 0 1px 0 rgba(255,255,255,.08);
+    backdrop-filter: blur(14px) saturate(125%);
+    -webkit-backdrop-filter: blur(14px) saturate(125%);
+  }
+
+  .hero.hero-cinematic .hero-text::before {
+    content: "";
+    display: block;
+    width: 64px;
+    height: 3px;
+    margin: 0 0 18px auto;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #f2b633, rgba(242,182,51,.35));
+  }
+
+  .hero.hero-cinematic .hero-badge {
+    padding: 7px 13px;
+    font-size: .82rem;
+    margin-bottom: 10px;
+  }
+
+  .hero.hero-cinematic h1 {
+    max-width: 680px;
+    margin: 10px 0 16px;
+    font-size: clamp(2.25rem, 3.5vw, 3.55rem);
+    line-height: 1.22;
+  }
+
+  .hero.hero-cinematic .hero-text p {
+    max-width: 680px;
+    margin: 0 0 24px;
+    font-size: 1.02rem;
+    line-height: 2;
+  }
+
+  .hero.hero-cinematic .hero-actions {
+    gap: 12px;
+  }
+
+  .hero.hero-cinematic .hero-actions .btn {
+    min-width: 150px;
+    justify-content: center;
+  }
+}
+
+@media (min-width: 1400px) {
+  .hero.hero-cinematic .hero-text {
+    width: min(800px, 46vw);
+    padding: 38px 46px 40px;
+  }
+}
+
+@media (max-width: 900px) {
+  .hero.hero-cinematic .hero-text {
+    width: 100%;
+    min-height: auto;
+    border-radius: 18px;
+  }
+}
